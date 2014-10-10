@@ -1,0 +1,212 @@
+#!/usr/bin/env python
+
+"""
+This hook is invoked by git-receive-pack, which happens when a push is invoked on a local repository.
+This is invoked just before updating the ref. It takes three parameters:
+
+refname - The name of the ref being updated.
+oldrev  - The old object name stored in the ref.
+newrev  - The new objectname to be stored in the ref.
+
+A zero exit allows the ref to be updated. A non-zero status prevents git-receive-pack from updating the ref.
+"""
+
+import sys
+import os
+import re
+import subprocess as sub
+import ConfigParser as parser
+from subprocess import Popen, PIPE, call
+from trac.util.text import to_unicode
+
+"""
+This is the default git executable. For non-standard installation, modify the value pointing to the git
+executable. You can get the path by executing the command:
+
+    which git
+
+"""
+GIT_PATH = '/usr/bin/git'
+
+"""
+This function is used to execute git commands (like git rev-list). It accepts arguments in a list args.
+"""
+
+def call_git(command, args):
+    pgit =  Popen([GIT_PATH, command] + args, stdout=PIPE)
+    result = pgit.communicate()[0]
+    pgit.stdout.close()
+    return result
+    #msg = to_unicode(call_git('rev-list', ['-n', '1', commit, '--pretty=medium']).rstrip())
+    #eml = to_unicode(call_git('rev-list', ['-n', '1', commit, '--pretty=format:%ae']).splitlines()[1])
+
+"""
+This is a sample git operation for checking out the head/master for the defined work tree.
+
+pcheckout = Popen(["GIT_WORK_TREE=/data/usap-git-acl git checkout -f master"], stdout=PIPE, shell=True)
+output = pcheckout.communicate()[0]
+ret = pcheckout.returncode
+print "Git checkout return code: %d" % ret
+if ret == 0:
+    print "The checkout has been executed successfully."
+    pcheckout.stdout.close()
+"""
+
+user = None
+
+# The remote user which pushes changes to the repository.
+user = os.environ['REMOTE_USER']
+
+if user is None:
+    print "The remote user is not identified."
+    exit(1)
+
+argv = sys.argv
+refname = argv[1]
+oldrev = argv[2]
+newrev = argv[3]
+
+pathdir = os.path.dirname(os.path.realpath(__file__)).strip()
+
+# This will be used as a base directory wherein all files will be relative to this one.
+
+ppwd = Popen(['pwd'],stdout=PIPE,shell=True)
+pwd = ppwd.communicate()[0]
+ppwd.stdout.close()
+pwd = pwd.strip()
+
+
+# Get the repository name.
+pgetrepo = Popen(['basename %s' % pwd], stdout=PIPE,shell=True)
+repository = pgetrepo.communicate()[0]
+pgetrepo.stdout.close()
+
+# Read the configuration file for the repository.
+repository = repository.strip()
+configfile = "%s/configs/%s" % (pathdir,repository)
+configfile = configfile.strip()
+config = parser.ConfigParser()
+config.read(configfile)
+
+# Initialized variables for tracking non-fast-forward push.
+missed_refs = None
+missed_ref_count = 0
+missed_refs_lines = None
+
+# Variable to check for new branches or revisions.
+zero = "0000000000000000000000000000000000000000"
+
+# Check if any commits are reachable from the older revision that are not reachable from the new revision.
+if oldrev != zero and newrev != zero:
+    missed_refs = call_git('rev-list',['%s..%s' % (newrev,oldrev)])
+
+#print "Missed refs..."
+
+if missed_refs is not None:
+    missed_refs_lines = missed_refs.split()
+    missed_ref_count = len(missed_refs_lines)
+    print "missed refs: %s" % missed_refs
+    print "missed refs count: %d" % missed_ref_count
+
+# Uncomment the lines below for debugging purposes.
+
+#if missed_refs_lines is not None:
+#    for r in missed_refs_lines:
+#        print "missed_ref_line: %s" % r
+
+# By default non-fast-forward is not allowed.
+no_ff = False
+# This will contain all the users which are allowed to push non-fast-forward.
+no_ff_users = []
+
+if missed_ref_count > 0:
+    no_ff = True
+    users_no_ff = None
+
+    print "[POLICY] Cannot push a non fast-forward reference by default."
+    
+    if config.has_option("common","can_no_ff"):
+        # Get users that are allowed to push non-fast-forward.
+	users_no_ff = config.get("common","can_no_ff")
+
+    if users_no_ff is not None:
+	users_no_ff_arr = users_no_ff.split(',')
+	for user_no_ff in users_no_ff_arr:
+	   usercleaned = user.strip() 
+	   no_ff_users.append(usercleaned)
+    else:
+	exit(1)
+
+# If the push is non-fast-forward, the user is checked if it is on the allowed users for non-fast-forward users.
+if no_ff:
+    if user not in no_ff_users:
+        print "%s not allowed for non fast-forward."
+        exit(1)
+
+refstr = config.get("common","cannot_delete")
+refsraw = refstr.split(',')
+refs = []
+on_tags = False
+
+for ref in refsraw:
+    ref_stripped = ref.strip()
+    refs.append(ref_stripped)
+
+# Check if operation is on the tags.
+if re.match(r'refs\/tags\/.+',refname) is not None:
+    on_tags = True
+
+# If operation is on the tags check if it is deleting the tag.
+# If deleting the tag, check if the user has a permission to delete the tag.
+if on_tags and (newrev == zero):
+    users_can_delete = config.get("common","can_delete_tags")
+    users_arr = users_can_delete.split(',')
+    users = []
+
+    for u in users_arr:
+        ucleaned = u.strip()
+        users.append(ucleaned)
+
+    if user in users:
+        exit(0)
+
+    print "Deleting the tag %s is not allowed." % refname
+    exit(1)
+
+# If the operation deletes the branch, check if the branch is not on the protected branch. 
+if refname in refs and (newrev == zero):
+    print "Deleting %s is not allowed." % refname
+    exit(1)
+
+# Set initial permission for user.
+# Will be used to set the user permission from the acl for the repository.
+ref_user_permission = None
+existing = False
+
+if config.has_section(refname) or on_tags:
+    existing = True
+
+if existing:
+    # for now, once user is only checked for rw permission
+    if config.has_option(refname, user):
+        ref_user_permission = config.get(refname,user)
+        
+    elif config.has_option('refs/tags/*',user):
+        if oldrev == zero:
+            ref_user_permission = config.get('refs/tags/*',user)
+        else:
+            # This is already not needed. Once the tag already exists, similar tag can not be pushed already.
+            print "You can't overwrite an existing tag."
+            
+    else:
+        print "Permission not found for user '%s'." % user
+else:
+    # If refname is not on the protected protected branches, the user is granted an rw permission.
+    if refname not in refs:
+        ref_user_permission = 'rw'
+
+if ref_user_permission == 'rw':
+    exit(0)
+
+else:
+    exit(1)

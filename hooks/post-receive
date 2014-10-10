@@ -1,0 +1,161 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import re
+
+from subprocess import Popen, PIPE, call
+from datetime import datetime
+from operator import itemgetter
+
+import trac
+import time
+import ConfigParser as parser
+from ticketupdater import *
+
+pathdir = os.path.dirname(os.path.realpath(__file__)).strip()
+
+ppwd = Popen(['pwd'],stdout=PIPE,shell=True)
+pwd = ppwd.communicate()[0]
+ppwd.stdout.close()
+pwd = pwd.strip()
+
+pgetrepo = Popen(['basename %s' % pwd], stdout=PIPE,shell=True)
+repository = pgetrepo.communicate()[0]
+pgetrepo.stdout.close()
+
+repository = repository.strip()
+configfile = "%s/configs/%s" % (pathdir,repository)
+configfile = configfile.strip()
+config = parser.ConfigParser()
+config.read(configfile)
+
+repository = repository.replace('.git','')
+repository_jenkins = repository
+trac_envs_raw_list = config.get("common","trac_environments")
+trac_envs_raw = trac_envs_raw_list.split(',')
+trac_envs = []
+trac_allowed = []
+
+trac_list_config_file = "%s/../trac/trac_envs.ini" % pathdir
+trac_list_config = parser.ConfigParser()
+trac_list_config.read(trac_list_config_file)
+
+repository_alias = config.get("common","repo_name")
+repository_alias = repository_alias.strip()
+repo_trac_alias = None
+
+if config.has_option("common", "repo_trac_alias"):
+    repo_trac_alias = config.get("common","repo_trac_alias").strip()
+
+if repo_trac_alias is not None:
+    repository = repo_trac_alias
+
+for trac_env in trac_envs_raw:
+    trac_env = trac_env.strip()
+    trac_envs.append(trac_env)
+    trac_name = trac_env.split('/')
+    trac_name = trac_name.pop()
+    trac_allowed.append(trac_name)
+
+trac_default_raw = config.get("common","trac_env_default")
+trac_default = trac_default_raw.strip()
+TRAC_ENV = trac_default
+GIT_PATH = '/usr/bin/git'
+
+if not 'PYTHON_EGG_CACHE' in os.environ:
+    os.environ['PYTHON_EGG_CACHE'] = '/tmp/.egg-cache'
+
+ticket_prefix = '(?:#|(?:ticket|issue|bug)[: ]?)'
+ticket_reference = ticket_prefix + '[0-9]+'
+ticket_command =  (r'(?P<action>[A-Za-z_]*).?'
+                   '(?P<ticket>%s(?:(?:[, &]*|[ ]?and[ ]?)%s)*)' %
+                   (ticket_reference, ticket_reference))
+command_re = re.compile(ticket_command)
+ticket_re = re.compile(ticket_prefix + '([0-9]+)')
+hours_re = re.compile("worked\s*(?P<hours>[0-9.]+)h")
+
+def call_git(command, args):
+    pgit =  Popen([GIT_PATH, command] + args, stdout=PIPE)
+    result = pgit.communicate()[0]
+    pgit.stdout.close()
+    return result
+
+
+def save_ticket_change( db, ticket_id, author, change_time, field, oldvalue, newvalue, dontinsert=False):
+    cursor = db.cursor();
+    cursor.execute("""INSERT INTO ticket_change  (ticket,time,author,field, oldvalue, newvalue)
+        VALUES(%s, %s, %s, %s, %s, %s)""",
+        (ticket_id, change_time, author, field, oldvalue, newvalue))
+    db.commit()
+
+
+def handle_commit(commit, ref):
+    from trac.ticket.notification import TicketNotifyEmail
+    from trac.ticket import Ticket
+    from trac.ticket.web_ui import TicketModule
+    from trac.util.text import to_unicode
+    from trac.util.datefmt import utc
+    from trac.env import open_environment
+    import time
+
+    #if not ref.startswith('refs/heads/') or ref[11:] not in ['master','develop']:
+    #    return
+
+    msg = to_unicode(call_git('rev-list', ['-n', '1', commit, '--pretty=medium']).rstrip())
+    eml = to_unicode(call_git('rev-list', ['-n', '1', commit, '--pretty=format:%ae']).splitlines()[1])
+    username = eml[0:eml.index('@')]
+    now = datetime.now(utc)
+    content = msg.split('\n\n', 1)[1]
+    tickets = {}
+
+    comment = """\
+In [changeset:"%s/%s"]:
+{{{#!CommitTicketReference repository="%s" revision="%s"
+%s
+}}}
+""" % (commit,repository,repository,commit,msg)
+
+    tickets = re.findall(ticket_command,msg)
+    ticketsit = iter(tickets)
+    for tkt_id in ticketsit:
+        user = None
+        userpwd = None
+        tup = None
+        utn = str(tkt_id[0])
+        utn = utn.strip()
+        tkt = tkt_id[1]
+        tkt = str(tkt)
+        tkt = tkt.replace('#','')
+
+        if utn in trac_allowed:
+
+            print "Updating ticket %s in %s" % (tkt,utn)
+
+            if trac_list_config.has_section(utn):
+                if trac_list_config.has_option(utn,"project"):
+                   project_dir = trac_list_config.get(utn,"project")
+                   tup = TicketUpdater(utn,trac_list_config_file)
+                   tup.save_ticket_change(int(tkt),username,int("%.0f" % (time.time()*1000000)),'comment',comment)
+                else:
+                   print "Please ask the administrator to integrate this repository with the new hook."
+            else:
+                print "Trac project not found: %s" % utn
+
+def handle_ref(old, new, ref):
+    if new == '0' * 40:
+	return
+    if old == '0' * 40:
+        return
+    args = (old == '0' * 40) and [new] or [new, '^' + old]
+    args.append('--reverse')
+    pending_commits = call_git('rev-list',args).splitlines()
+	
+    for commit in pending_commits:
+        handle_commit(commit, ref)
+
+ 
+if __name__ == '__main__':
+    lines = sys.stdin
+    for line in sys.stdin:
+        handle_ref(*line.split())

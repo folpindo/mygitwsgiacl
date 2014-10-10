@@ -1,0 +1,17 @@
+[common]
+cannot_delete = refs/heads/master,refs/heads/develop,refs/tags
+can_delete_tags = user1
+trac_environments = /var/www/trac
+trac_env_default = /var/www/trac/
+repo_name = usap-git-acl
+intertrac = /usr/share/trac/conf/intertrac.ini
+can_no_ff = user1
+
+[refs/tags/*]
+user1 = rw
+
+[refs/heads/master]
+user2 = rw
+
+[refs/heads/develop]
+user3 = rw
